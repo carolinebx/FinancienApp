@@ -1,0 +1,12 @@
+{
+  "name": "Huishoudboekje",
+  "short_name": "Huishoudboekje",
+  "description": "Persoonlijk budget- en spaaroverzicht",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F7F5F0",
+  "theme_color": "#0F5C52",
+  "icons": [
+    { "src": "/icon.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
