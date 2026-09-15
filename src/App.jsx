@@ -2,8 +2,10 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { storage } from "./storage.js";
 import {
   Wallet, TrendingUp, Plane, Settings, ChevronLeft, ChevronRight,
-  Check, AlertTriangle, PiggyBank, Home, RotateCcw, Landmark
+  Check, AlertTriangle, PiggyBank, Home, RotateCcw, Landmark, ShoppingCart, Activity,
 } from "lucide-react";
+import Papa from "papaparse";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 
 // ---------- constants & helpers ----------
 
@@ -50,11 +52,6 @@ const monthsBetween = (fromDateStr, toDateStr) => {
   const to = new Date(toDateStr);
   return (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth());
 };
-const addYears = (dateStr, n) => {
-  const d = new Date(dateStr);
-  d.setFullYear(d.getFullYear() + n);
-  return d.toISOString().slice(0, 10);
-};
 const addMonthsToDate = (dateStr, n) => {
   const d = new Date(dateStr);
   d.setMonth(d.getMonth() + n);
@@ -63,15 +60,15 @@ const addMonthsToDate = (dateStr, n) => {
 const cycleMonths = (frequentiePerJaar) => Math.max(1, Math.round(12 / (frequentiePerJaar || 1)));
 
 const DEFAULT_VARIABLE = [
-  { id: "boodschappen", naam: "Boodschappen", budget: 330 },
-  { id: "reizen", naam: "Reizen", budget: 70 },
-  { id: "kleding", naam: "Kleding", budget: 60 },
-  { id: "verzorging", naam: "Verzorging", budget: 40 },
-  { id: "huishouden", naam: "Huishouden", budget: 40 },
-  { id: "horeca", naam: "Uitgaan / Horeca", budget: 120 },
-  { id: "uitjes", naam: "Uitjes / Sport", budget: 80 },
-  { id: "abonnementen", naam: "Abonnementen (overig)", budget: 15 },
-  { id: "buffer", naam: "Overig / buffer", budget: 67.55 },
+  { id: "boodschappen", naam: "Boodschappen", budget: 330, keywords: ["albert heijn", "jumbo", "lidl", "aldi", "dirk", "plus supermarkt"] },
+  { id: "reizen", naam: "Reizen", budget: 70, keywords: ["ns ", "ov-chipkaart", "gvb", "ret ", "shell", "esso", "tango"] },
+  { id: "kleding", naam: "Kleding", budget: 60, keywords: ["zalando", "h&m", "primark", "zara"] },
+  { id: "verzorging", naam: "Verzorging", budget: 40, keywords: ["kruidvat", "etos", "ici paris"] },
+  { id: "huishouden", naam: "Huishouden", budget: 40, keywords: ["action", "ikea", "hema"] },
+  { id: "horeca", naam: "Uitgaan / Horeca", budget: 120, keywords: ["thuisbezorgd", "uber eats", "cafe", "restaurant"] },
+  { id: "uitjes", naam: "Uitjes / Sport", budget: 80, keywords: ["bioscoop", "sportschool"] },
+  { id: "abonnementen", naam: "Abonnementen (overig)", budget: 15, keywords: [] },
+  { id: "buffer", naam: "Overig / buffer", budget: 67.55, keywords: [] },
 ];
 
 const DEFAULT_VASTE_MAANDELIJKS = [
@@ -112,6 +109,8 @@ const DEFAULT_SAVINGS_ACCOUNTS = [
   { id: "oranje", naam: "Oranje Spaarrekening", saldo: 0 },
 ];
 
+const DEFAULT_WENSLIJST = [];
+
 const STORAGE_KEY = "budget-tracker-v2";
 
 const defaultState = () => ({
@@ -121,8 +120,10 @@ const defaultState = () => ({
   vasteJaarlijks: DEFAULT_VASTE_JAARLIJKS,
   goals: DEFAULT_GOALS,
   savingsAccounts: DEFAULT_SAVINGS_ACCOUNTS,
+  wenslijst: DEFAULT_WENSLIJST,
   payPeriodStartDay: 25,
-  monthly: {}, // { "2026-09": { spent: { boodschappen: 12.3, ... } } }
+  // { "2026-09": { spent: {...}, jaarlijkseBetalingen: [...], jaarlijkseStortingen: [...], geplandeUitgaven: [...] } }
+  monthly: {},
 });
 
 const OLD_COMBINED_ID = "verzekeringenbelasting";
@@ -163,16 +164,143 @@ function migrateIncome(income) {
 function safeMergeState(parsed) {
   const d = defaultState();
   const vasteJaarlijksRaw = Array.isArray(parsed.vasteJaarlijks) ? parsed.vasteJaarlijks : d.vasteJaarlijks;
+  const variableRaw = Array.isArray(parsed.variable) ? parsed.variable : d.variable;
+  const wenslijstRaw = Array.isArray(parsed.wenslijst) ? parsed.wenslijst : d.wenslijst;
   return {
     income: migrateIncome(parsed.income),
-    variable: Array.isArray(parsed.variable) ? parsed.variable : d.variable,
+    variable: variableRaw.map((c) => ({ keywords: [], ...c })),
     vasteMaandelijks: Array.isArray(parsed.vasteMaandelijks) ? parsed.vasteMaandelijks : d.vasteMaandelijks,
     vasteJaarlijks: migrateVasteJaarlijks(vasteJaarlijksRaw),
     goals: Array.isArray(parsed.goals) ? parsed.goals : d.goals,
     savingsAccounts: Array.isArray(parsed.savingsAccounts) ? parsed.savingsAccounts : d.savingsAccounts,
+    wenslijst: wenslijstRaw.map((w) => ({ prioriteit: "gemiddeld", label: "", gekocht: false, ...w })),
     payPeriodStartDay: typeof parsed.payPeriodStartDay === "number" ? parsed.payPeriodStartDay : d.payPeriodStartDay,
     monthly: parsed.monthly && typeof parsed.monthly === "object" ? parsed.monthly : {},
   };
+}
+
+// som van alle variabele uitgaven (handmatig ingevoerd + geplande wenslijst-aankopen) in een maand
+const maandVariabelTotaal = (entry) => {
+  const spentSom = Object.values(entry?.spent || {}).reduce((a, b) => a + (Number(b) || 0), 0);
+  const geplandSom = (entry?.geplandeUitgaven || []).reduce((a, e) => a + (Number(e.bedrag) || 0), 0);
+  return spentSom + geplandSom;
+};
+
+// ---------- import & auto-categorisering van banktransacties ----------
+
+function parseDutchAmount(str) {
+  if (str == null) return NaN;
+  let s = String(str).trim();
+  if (!s) return NaN;
+  s = s.replace(/[^0-9,.\-]/g, "");
+  if (!s) return NaN;
+  if (s.includes(",") && s.lastIndexOf(",") > s.lastIndexOf(".")) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    s = s.replace(/,(?=\d{3}(\D|$))/g, "");
+  }
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function detectColumn(headers, candidates) {
+  const lower = headers.map((h) => h.toLowerCase());
+  for (const cand of candidates) {
+    const idx = lower.findIndex((h) => h.includes(cand));
+    if (idx !== -1) return headers[idx];
+  }
+  return null;
+}
+
+// Probeert een bank-CSV te herkennen (ING/ABN/Rabobank-achtige exports). Geeft null terug als dat niet lukt.
+function parseBankCSV(text) {
+  for (const delim of [";", ",", "\t"]) {
+    let result;
+    try {
+      result = Papa.parse(text, { header: true, delimiter: delim, skipEmptyLines: true });
+    } catch (e) {
+      continue;
+    }
+    const headers = result.meta && result.meta.fields;
+    if (result.data && result.data.length > 0 && headers && headers.length > 1) {
+      const amountCol = detectColumn(headers, ["bedrag", "amount", "value"]);
+      const descCol = detectColumn(headers, ["omschrijving", "mededeling", "naam", "description", "tegenpartij", "tegenrekening"]);
+      const dateCol = detectColumn(headers, ["datum", "date"]);
+      const afbijCol = detectColumn(headers, ["af bij", "af/bij", "af_bij"]);
+      if (amountCol) {
+        const rows = result.data
+          .map((row) => {
+            let bedrag = parseDutchAmount(row[amountCol]);
+            if (afbijCol && row[afbijCol]) {
+              const waarde = String(row[afbijCol]).toLowerCase();
+              const isAf = waarde.includes("af") && !waarde.includes("bij");
+              bedrag = Math.abs(bedrag) * (isAf ? -1 : 1);
+            }
+            return {
+              datum: dateCol ? row[dateCol] : "",
+              omschrijving: descCol ? row[descCol] : Object.values(row).filter(Boolean).join(" "),
+              bedrag,
+            };
+          })
+          .filter((r) => Number.isFinite(r.bedrag));
+        if (rows.length > 0) return rows;
+      }
+    }
+  }
+  return null;
+}
+
+// Fallback: platte tekst (bv. geplakt uit een PDF-afschrift), één transactie per regel,
+// waarbij het bedrag aan het eind van de regel staat.
+function parsePlainText(text) {
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/(-?[\d.,]+)\s*(?:eur|€)?\s*$/i);
+      if (!match) return null;
+      const bedrag = parseDutchAmount(match[1]);
+      if (!Number.isFinite(bedrag)) return null;
+      const omschrijving = line.slice(0, match.index).trim() || line;
+      return { datum: "", omschrijving, bedrag: -Math.abs(bedrag) };
+    })
+    .filter(Boolean);
+}
+
+function matchCategorie(omschrijving, variable) {
+  const text = (omschrijving || "").toLowerCase();
+  for (const cat of variable) {
+    const kws = cat.keywords || [];
+    if (kws.some((k) => k && text.includes(String(k).toLowerCase()))) return cat.id;
+  }
+  return "";
+}
+
+// ---------- achterstand-detectie voor jaarpotjes en spaardoelen ----------
+
+function jaarpotStatus(item, today) {
+  const cyclusMaanden = cycleMonths(item.frequentiePerJaar || 1);
+  const cyclusStart = addMonthsToDate(item.verwachteDatum, -cyclusMaanden);
+  const verstreken = Math.min(cyclusMaanden, Math.max(0, monthsBetween(cyclusStart, today)));
+  const verwachtPct = cyclusMaanden > 0 ? (verstreken / cyclusMaanden) * 100 : 0;
+  const bedrag = Number(item.bedrag) || 0;
+  const gespaard = Number(item.gespaard) || 0;
+  const actueelPct = bedrag > 0 ? (gespaard / bedrag) * 100 : 100;
+  const verwachtBedrag = bedrag * (cyclusMaanden > 0 ? verstreken / cyclusMaanden : 0);
+  const tekort = Math.max(0, verwachtBedrag - gespaard);
+  const achterstand = bedrag > 0 && actueelPct < verwachtPct - 8;
+  return { verwachtPct, actueelPct, tekort, achterstand };
+}
+
+function goalStatus(goal, gemSparen, today) {
+  const doel = Number(goal.doel) || 0;
+  const algespaard = Number(goal.algespaard) || 0;
+  const resterend = Math.max(0, doel - algespaard);
+  const maanden = Math.max(0, monthsBetween(today, goal.deadline));
+  const benodigdPerMaand = maanden > 0 ? resterend / maanden : resterend;
+  const opSchema = gemSparen >= benodigdPerMaand;
+  return { resterend, maanden, benodigdPerMaand, opSchema };
 }
 
 // ---------- small UI atoms ----------
@@ -254,8 +382,8 @@ export default function App() {
     setSaveStatus("saving");
     const t = setTimeout(async () => {
       try {
-        await storage.set(STORAGE_KEY, JSON.stringify(state));
-        setSaveStatus("saved");
+        const result = await storage.set(STORAGE_KEY, JSON.stringify(state));
+        setSaveStatus(result ? "saved" : "error");
       } catch (e) {
         console.error(e);
         setSaveStatus("error");
@@ -363,6 +491,122 @@ export default function App() {
     });
   }, [currentMonth]);
 
+  // ---- NIEUW: zelf bijhouden hoeveel je deze maand opzij zet voor de jaarpotjes ----
+  const addStorting = useCallback((itemId, bedrag) => {
+    if (!(bedrag > 0)) return;
+    setState((prev) => {
+      const item = prev.vasteJaarlijks.find((v) => v.id === itemId);
+      if (!item) return prev;
+      const vasteJaarlijks = prev.vasteJaarlijks.map((v) =>
+        v.id === itemId ? { ...v, gespaard: (Number(v.gespaard) || 0) + bedrag } : v
+      );
+      const existing = prev.monthly[currentMonth] || { spent: {} };
+      const entry = { id: newId("storting"), itemId, naam: item.naam, bedrag };
+      const stortingen = [...(existing.jaarlijkseStortingen || []), entry];
+      return {
+        ...prev,
+        vasteJaarlijks,
+        monthly: { ...prev.monthly, [currentMonth]: { ...existing, jaarlijkseStortingen: stortingen } },
+      };
+    });
+  }, [currentMonth]);
+
+  const removeStorting = useCallback((entryId) => {
+    setState((prev) => {
+      const existing = prev.monthly[currentMonth] || { spent: {} };
+      const stortingen = existing.jaarlijkseStortingen || [];
+      const entry = stortingen.find((s) => s.id === entryId);
+      if (!entry) return prev;
+      const vasteJaarlijks = prev.vasteJaarlijks.map((v) =>
+        v.id === entry.itemId ? { ...v, gespaard: Math.max(0, (Number(v.gespaard) || 0) - entry.bedrag) } : v
+      );
+      return {
+        ...prev,
+        vasteJaarlijks,
+        monthly: {
+          ...prev.monthly,
+          [currentMonth]: { ...existing, jaarlijkseStortingen: stortingen.filter((s) => s.id !== entryId) },
+        },
+      };
+    });
+  }, [currentMonth]);
+
+  // ---- NIEUW: wenslijst met inplanbare uitgaven ----
+  const addWishItem = () =>
+    setState((prev) => ({
+      ...prev,
+      wenslijst: [
+        ...prev.wenslijst,
+        {
+          id: newId("wish"), naam: "Nieuwe wens", bedrag: 0, categorieId: prev.variable[0]?.id || "",
+          geplandInMaand: null, prioriteit: "gemiddeld", label: "", gekocht: false,
+        },
+      ],
+    }));
+  const updateWishItem = (id, field, value) => updateListItem("wenslijst", id, field, value);
+  const toggleGekocht = useCallback((id) => {
+    setState((prev) => ({
+      ...prev,
+      wenslijst: prev.wenslijst.map((w) => (w.id === id ? { ...w, gekocht: !w.gekocht } : w)),
+    }));
+  }, []);
+  const removeWishItem = useCallback((id) => {
+    setState((prev) => {
+      const monthly = { ...prev.monthly };
+      Object.keys(monthly).forEach((k) => {
+        if ((monthly[k].geplandeUitgaven || []).some((e) => e.wishId === id)) {
+          monthly[k] = { ...monthly[k], geplandeUitgaven: monthly[k].geplandeUitgaven.filter((e) => e.wishId !== id) };
+        }
+      });
+      return { ...prev, monthly, wenslijst: prev.wenslijst.filter((w) => w.id !== id) };
+    });
+  }, []);
+
+  const toggleWishPlanning = useCallback((item) => {
+    setState((prev) => {
+      const monthly = { ...prev.monthly };
+      if (item.geplandInMaand && monthly[item.geplandInMaand]) {
+        monthly[item.geplandInMaand] = {
+          ...monthly[item.geplandInMaand],
+          geplandeUitgaven: (monthly[item.geplandInMaand].geplandeUitgaven || []).filter((e) => e.wishId !== item.id),
+        };
+      }
+      let wenslijst;
+      if (item.geplandInMaand === currentMonth) {
+        wenslijst = prev.wenslijst.map((w) => (w.id === item.id ? { ...w, geplandInMaand: null } : w));
+      } else {
+        const existing = monthly[currentMonth] || { spent: {} };
+        const entry = { id: newId("plan"), wishId: item.id, naam: item.naam, bedrag: Number(item.bedrag) || 0, categorieId: item.categorieId || null };
+        monthly[currentMonth] = { ...existing, geplandeUitgaven: [...(existing.geplandeUitgaven || []), entry] };
+        wenslijst = prev.wenslijst.map((w) => (w.id === item.id ? { ...w, geplandInMaand: currentMonth } : w));
+      }
+      return { ...prev, monthly, wenslijst };
+    });
+  }, [currentMonth]);
+
+  // ---- NIEUW: bank-import in bulk verwerken + trefwoorden onthouden ----
+  const importSpentBulk = useCallback((sumsByCat) => {
+    setState((prev) => {
+      const existing = prev.monthly[currentMonth] || { spent: {} };
+      const nextSpent = { ...existing.spent };
+      Object.entries(sumsByCat).forEach(([catId, bedrag]) => {
+        nextSpent[catId] = (Number(nextSpent[catId]) || 0) + (Number(bedrag) || 0);
+      });
+      return { ...prev, monthly: { ...prev.monthly, [currentMonth]: { ...existing, spent: nextSpent } } };
+    });
+  }, [currentMonth]);
+
+  const addKeywordToCategorie = useCallback((catId, keyword) => {
+    const kw = (keyword || "").trim().toLowerCase();
+    if (!kw) return;
+    setState((prev) => ({
+      ...prev,
+      variable: prev.variable.map((c) =>
+        c.id === catId ? { ...c, keywords: Array.from(new Set([...(c.keywords || []), kw])) } : c
+      ),
+    }));
+  }, []);
+
   const updateGoal = (id, field, value) =>
     setState((prev) => ({ ...prev, goals: prev.goals.map((g) => (g.id === id ? { ...g, [field]: value } : g)) }));
 
@@ -403,21 +647,51 @@ export default function App() {
   const vasteTotaal = vasteMaandelijksTotaal + jaarlijksPotTotaal;
 
   const variabelBudgetTotaal = state.variable.reduce((s, c) => s + (Number(c.budget) || 0), 0);
-  const variabelBestedTotaal = state.variable.reduce((s, c) => s + (Number(monthData.spent[c.id]) || 0), 0);
+  const variabelBestedTotaal = maandVariabelTotaal(monthData);
   const jaarlijkseTekortDezeMaand = (monthData.jaarlijkseBetalingen || []).reduce((s, b) => s + (Number(b.tekort) || 0), 0);
+  const jaarlijksGestortDezeMaand = (monthData.jaarlijkseStortingen || []).reduce((s, e) => s + (Number(e.bedrag) || 0), 0);
   const sparenDezeMaand = totaalInkomen - vasteTotaal - variabelBestedTotaal - jaarlijkseTekortDezeMaand;
 
   const monthsWithData = Object.keys(state.monthly).filter(
-    (k) => Object.keys(state.monthly[k].spent || {}).length > 0 || (state.monthly[k].jaarlijkseBetalingen || []).length > 0
+    (k) =>
+      Object.keys(state.monthly[k].spent || {}).length > 0 ||
+      (state.monthly[k].jaarlijkseBetalingen || []).length > 0 ||
+      (state.monthly[k].geplandeUitgaven || []).length > 0
   );
   const gemSparen =
     monthsWithData.length > 0
       ? monthsWithData.reduce((sum, k) => {
-          const spentSum = Object.values(state.monthly[k].spent || {}).reduce((a, b) => a + (Number(b) || 0), 0);
-          const tekortSum = (state.monthly[k].jaarlijkseBetalingen || []).reduce((a, b) => a + (Number(b.tekort) || 0), 0);
-          return sum + (totaalInkomen - vasteTotaal - spentSum - tekortSum);
+          const variabelSom = maandVariabelTotaal(state.monthly[k]);
+          const tekortSom = (state.monthly[k].jaarlijkseBetalingen || []).reduce((a, b) => a + (Number(b.tekort) || 0), 0);
+          return sum + (totaalInkomen - vasteTotaal - variabelSom - tekortSom);
         }, 0) / monthsWithData.length
       : sparenDezeMaand;
+
+  const maandenMetStorting = Object.keys(state.monthly).filter((k) => (state.monthly[k].jaarlijkseStortingen || []).length > 0);
+  const gemStortingPerMaand =
+    maandenMetStorting.length > 0
+      ? maandenMetStorting.reduce(
+          (sum, k) => sum + (state.monthly[k].jaarlijkseStortingen || []).reduce((a, e) => a + (Number(e.bedrag) || 0), 0),
+          0
+        ) / maandenMetStorting.length
+      : 0;
+
+  const trendData = Object.keys(state.monthly)
+    .sort()
+    .map((k) => {
+      const entry = state.monthly[k];
+      const variabelSom = maandVariabelTotaal(entry);
+      const tekortSom = (entry.jaarlijkseBetalingen || []).reduce((a, b) => a + (Number(b.tekort) || 0), 0);
+      const gestortSom = (entry.jaarlijkseStortingen || []).reduce((a, e) => a + (Number(e.bedrag) || 0), 0);
+      const sparen = totaalInkomen - vasteTotaal - variabelSom - tekortSom;
+      return {
+        maand: periodLabel(k, state.payPeriodStartDay).split(" – ")[0],
+        key: k,
+        uitgaven: Math.round(variabelSom * 100) / 100,
+        sparen: Math.round(sparen * 100) / 100,
+        gestort: Math.round(gestortSom * 100) / 100,
+      };
+    });
 
   return (
     <div style={{ fontFamily: "'Inter', sans-serif", background: "#F7F5F0", minHeight: "100%", padding: "20px 16px 60px", color: "#1F2937" }}>
@@ -452,7 +726,7 @@ export default function App() {
           <div>
             <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 26, letterSpacing: -0.5 }}>Huishoudboekje</div>
             <div style={{ fontSize: 12.5, color: notConfigured || saveStatus === "error" ? "#B3492A" : "#8A8171", marginTop: 2 }}>
-              {notConfigured ? "niet opgeslagen — Sheet nog niet gekoppeld" : saveStatus === "saving" ? "opslaan…" : saveStatus === "error" ? "opslaan mislukt" : "opgeslagen"}
+              {notConfigured ? "niet opgeslagen — alleen in deze sessie onthouden" : saveStatus === "saving" ? "opslaan…" : saveStatus === "error" ? "opslaan mislukt" : "opgeslagen"}
             </div>
           </div>
           <Wallet size={26} color="#0F5C52" strokeWidth={1.6} />
@@ -460,13 +734,15 @@ export default function App() {
 
         {notConfigured && (
           <div style={{ background: "#FBEAE3", border: "1px solid #E8C4B3", borderRadius: 12, padding: "12px 14px", marginBottom: 18, fontSize: 12.5, color: "#7A3A22" }}>
-            <strong>Google Sheet nog niet gekoppeld.</strong> Je gegevens worden nu alleen in deze sessie onthouden en zijn weg na het herladen. Vul <code>SHEET_API_URL</code> en <code>API_TOKEN</code> in bij <code>src/config.js</code> — zie <code>GOOGLE_SHEET_SETUP.md</code> voor de stappen.
+            <strong>Opslag nog niet beschikbaar.</strong> Je gegevens worden nu alleen in deze sessie onthouden en zijn weg na het herladen.
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 4, marginBottom: 18, background: "#EFEAE0", padding: 4, borderRadius: 12 }}>
+        <div style={{ display: "flex", gap: 4, marginBottom: 18, background: "#EFEAE0", padding: 4, borderRadius: 12, flexWrap: "wrap" }}>
           {[
             { id: "maand", label: "Deze maand", icon: TrendingUp },
+            { id: "wenslijst", label: "Wenslijst", icon: ShoppingCart },
+            { id: "overzicht", label: "Overzicht", icon: Activity },
             { id: "doelen", label: "Spaardoelen", icon: Plane },
             { id: "rekeningen", label: "Spaarrekeningen", icon: Landmark },
             { id: "vast", label: "Vaste lasten", icon: Home },
@@ -477,7 +753,7 @@ export default function App() {
               className="btab"
               onClick={() => setTab(t.id)}
               style={{
-                flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                flex: 1, minWidth: 88, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
                 padding: "9px 6px", borderRadius: 9, fontSize: 12.5, fontWeight: 600,
                 color: tab === t.id ? "#FFFFFF" : "#6B6353",
                 background: tab === t.id ? "#0F5C52" : "transparent",
@@ -503,8 +779,41 @@ export default function App() {
             variabelBestedTotaal={variabelBestedTotaal}
             sparenDezeMaand={sparenDezeMaand}
             jaarlijkseTekortDezeMaand={jaarlijkseTekortDezeMaand}
+            jaarlijksGestortDezeMaand={jaarlijksGestortDezeMaand}
+            jaarlijksPotTotaal={jaarlijksPotTotaal}
+            jaarlijksReservering={jaarlijksReservering}
             addJaarlijkseBetalingDezeMaand={addJaarlijkseBetalingDezeMaand}
             removeJaarlijkseBetalingDezeMaand={removeJaarlijkseBetalingDezeMaand}
+            addStorting={addStorting}
+            removeStorting={removeStorting}
+            wenslijst={state.wenslijst}
+            toggleWishPlanning={toggleWishPlanning}
+            importSpentBulk={importSpentBulk}
+            addKeywordToCategorie={addKeywordToCategorie}
+          />
+        )}
+
+        {tab === "wenslijst" && (
+          <WenslijstTab
+            wenslijst={state.wenslijst}
+            variable={state.variable}
+            currentMonth={currentMonth}
+            payPeriodStartDay={state.payPeriodStartDay}
+            addWishItem={addWishItem}
+            updateWishItem={updateWishItem}
+            removeWishItem={removeWishItem}
+            toggleWishPlanning={toggleWishPlanning}
+            toggleGekocht={toggleGekocht}
+          />
+        )}
+
+        {tab === "overzicht" && (
+          <OverzichtTab
+            trendData={trendData}
+            vasteJaarlijks={state.vasteJaarlijks}
+            goals={state.goals}
+            gemSparen={gemSparen}
+            today={today}
           />
         )}
 
@@ -526,6 +835,7 @@ export default function App() {
             vasteJaarlijks={state.vasteJaarlijks}
             jaarlijksReservering={jaarlijksReservering}
             jaarlijksPotTotaal={jaarlijksPotTotaal}
+            gemStortingPerMaand={gemStortingPerMaand}
             totaalInkomen={totaalInkomen}
             variabelBudgetTotaal={variabelBudgetTotaal}
             today={today}
@@ -562,10 +872,367 @@ export default function App() {
 
 // ---------- tabs ----------
 
+function JaarpotSparenCard({ vasteJaarlijks, jaarlijksReservering, jaarlijksPotTotaal, jaarlijksGestortDezeMaand, stortingen, addStorting, removeStorting }) {
+  const [openId, setOpenId] = useState(null);
+  const [bedragInput, setBedragInput] = useState("");
+
+  const openFor = (item) => {
+    setOpenId(item.id);
+    const aanbevolen = jaarlijksReservering(item);
+    setBedragInput(String(Math.round(aanbevolen * 100) / 100));
+  };
+
+  const handleAdd = (itemId) => {
+    const bedrag = parseFloat(bedragInput) || 0;
+    if (bedrag <= 0) return;
+    addStorting(itemId, bedrag);
+    setOpenId(null);
+    setBedragInput("");
+  };
+
+  return (
+    <Card style={{ padding: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 20px 4px" }}>
+        <PiggyBank size={16} color="#0F5C52" />
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>Sparen voor jaarlijkse lasten</div>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A8171", padding: "0 20px 10px" }}>
+        Houd hier zelf bij hoeveel je deze maand opzij zet. De aanbevolen reservering is een richtlijn op basis van bedrag, datum en frequentie — jij bepaalt wat je daadwerkelijk stort.
+      </div>
+      <div>
+        {vasteJaarlijks.map((v) => {
+          const aanbevolen = jaarlijksReservering(v);
+          const pct = v.bedrag > 0 ? (v.gespaard / v.bedrag) * 100 : 0;
+          return (
+            <div key={v.id} style={{ padding: "10px 20px", borderTop: "1px solid #EEE9DD" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontSize: 13.5, fontWeight: 500 }}>{v.naam}</div>
+                <div style={{ fontSize: 11.5, color: "#8A8171", fontFamily: "'IBM Plex Mono', monospace" }}>{fmt(v.gespaard)} / {fmt(v.bedrag)}</div>
+              </div>
+              <div style={{ marginTop: 6 }}>
+                <ProgressBar pct={pct} tone={pct >= 100 ? "ok" : "warn"} />
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
+                <span style={{ fontSize: 11, color: "#8A8171" }}>aanbevolen: {fmt2(aanbevolen)}/mnd</span>
+                {openId !== v.id && (
+                  <button className="btab" onClick={() => openFor(v)} style={{ fontSize: 11, fontWeight: 600, color: "#0F5C52", border: "1px solid #CFE3DC", borderRadius: 8, padding: "4px 9px" }}>
+                    + zet apart
+                  </button>
+                )}
+              </div>
+              {openId === v.id && (
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                  <input className="num-input" style={{ width: 84 }} type="number" value={bedragInput} onChange={(e) => setBedragInput(e.target.value)} />
+                  <button className="btab" onClick={() => handleAdd(v.id)} style={{ fontSize: 12, fontWeight: 600, color: "#FFFFFF", background: "#0F5C52", borderRadius: 8, padding: "6px 11px" }}>
+                    Bewaren
+                  </button>
+                  <button className="btab" onClick={() => setOpenId(null)} style={{ fontSize: 11.5, color: "#8A8171" }}>
+                    annuleer
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {vasteJaarlijks.length === 0 && <div style={{ padding: "0 20px 14px", fontSize: 12, color: "#B8AF9C" }}>Nog geen jaarlijkse lasten ingesteld.</div>}
+      </div>
+      <div style={{ borderTop: "1px solid #EEE9DD", padding: "10px 20px", display: "flex", justifyContent: "space-between", fontSize: 12.5 }}>
+        <span>Gestort deze maand</span>
+        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, color: jaarlijksGestortDezeMaand >= jaarlijksPotTotaal ? "#2F7A5C" : "#C08A2E" }}>
+          {fmt2(jaarlijksGestortDezeMaand)} / {fmt2(jaarlijksPotTotaal)}
+        </span>
+      </div>
+      {stortingen.length > 0 && (
+        <div style={{ borderTop: "1px solid #EEE9DD" }}>
+          {stortingen.map((s) => (
+            <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 20px", borderBottom: "1px solid #EEE9DD" }}>
+              <span style={{ fontSize: 12.5 }}>{s.naam} · {fmt2(s.bedrag)}</span>
+              <button className="btab" onClick={() => removeStorting(s.id)} style={{ fontSize: 11, color: "#8A8171" }}>
+                verwijder
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function GeplandeUitgavenCard({ entries, wenslijst, toggleWishPlanning, variable }) {
+  if (!entries || entries.length === 0) return null;
+  const categorieNaam = (id) => variable.find((c) => c.id === id)?.naam;
+  const totaal = entries.reduce((s, e) => s + (Number(e.bedrag) || 0), 0);
+  return (
+    <Card style={{ padding: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "14px 20px 6px" }}>
+        <ShoppingCart size={16} color="#0F5C52" />
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15, flex: 1 }}>Geplande uitgaven deze maand</div>
+        <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5, color: "#8A8171" }}>{fmt2(totaal)}</span>
+      </div>
+      <div style={{ fontSize: 11, color: "#8A8171", padding: "0 20px 8px" }}>
+        Vanuit je wenslijst ingepland — telt automatisch mee bij je uitgaven per categorie hieronder.
+      </div>
+      <div>
+        {entries.map((e) => (
+          <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 20px", borderTop: "1px solid #EEE9DD" }}>
+            <div>
+              <div style={{ fontSize: 13.5, fontWeight: 500 }}>{e.naam}</div>
+              <div style={{ fontSize: 11, color: "#8A8171" }}>
+                {fmt2(e.bedrag)}{e.categorieId ? ` · ${categorieNaam(e.categorieId) || "categorie"}` : " · geen categorie"}
+              </div>
+            </div>
+            <button
+              className="btab"
+              onClick={() => {
+                const wish = wenslijst.find((w) => w.id === e.wishId);
+                if (wish) toggleWishPlanning(wish);
+              }}
+              style={{ fontSize: 11, color: "#8A8171" }}
+            >
+              annuleer
+            </button>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importSpentBulk, addKeywordToCategorie }) {
+  const [open, setOpen] = useState(false);
+  const [rawText, setRawText] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [rows, setRows] = useState(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => setRawText(String(reader.result || ""));
+    reader.readAsText(file);
+  };
+
+  const analyseer = () => {
+    if (!rawText.trim()) return;
+    let parsed = parseBankCSV(rawText);
+    if (!parsed || parsed.length === 0) parsed = parsePlainText(rawText);
+    const uitgaven = (parsed || []).filter((r) => r.bedrag < 0);
+    setRows(
+      uitgaven.map((r, i) => ({
+        id: `imp-${i}`,
+        datum: r.datum,
+        omschrijving: r.omschrijving,
+        bedrag: Math.abs(r.bedrag),
+        categorieId: matchCategorie(r.omschrijving, variable),
+        include: true,
+      }))
+    );
+  };
+
+  const updateRow = (id, field, value) => setRows((prev) => prev.map((r) => (r.id === id ? { ...r, [field]: value } : r)));
+
+  const totalenPerCategorie = useMemo(() => {
+    if (!rows) return {};
+    const sums = {};
+    rows.filter((r) => r.include && r.categorieId).forEach((r) => {
+      sums[r.categorieId] = (sums[r.categorieId] || 0) + (Number(r.bedrag) || 0);
+    });
+    return sums;
+  }, [rows]);
+
+  const verwerk = () => {
+    if (!rows) return;
+    importSpentBulk(totalenPerCategorie);
+    setRows(null);
+    setRawText("");
+    setFileName("");
+    setOpen(false);
+  };
+
+  const categorieNaam = (id) => variable.find((c) => c.id === id)?.naam;
+
+  return (
+    <Card style={{ padding: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px 6px" }}>
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>Bank-uitgaven importeren</div>
+        <button className="btab" onClick={() => setOpen((o) => !o)} style={{ fontSize: 12, fontWeight: 600, color: "#0F5C52", border: "1px solid #CFE3DC", borderRadius: 8, padding: "5px 10px" }}>
+          {open ? "Sluiten" : "+ Importeren"}
+        </button>
+      </div>
+      {!open && (
+        <div style={{ padding: "0 20px 16px", fontSize: 11.5, color: "#8A8171" }}>
+          Upload een CSV-export van je bank, of plak transacties — ook gekopieerd uit een PDF-afschrift — en de app koppelt ze automatisch aan een categorie.
+        </div>
+      )}
+      {open && (
+        <div style={{ padding: "6px 20px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+          {!rows && (
+            <>
+              <div style={{ fontSize: 11.5, color: "#8A8171" }}>
+                Kies een CSV-bestand van je bank, of plak losse transactieregels. Elke regel eindigt met een bedrag; de rest wordt gezien als omschrijving.
+              </div>
+              <input type="file" accept=".csv,text/csv,text/plain" onChange={handleFile} style={{ fontSize: 12 }} />
+              {fileName && <div style={{ fontSize: 11, color: "#8A8171" }}>{fileName} geladen</div>}
+              <textarea
+                value={rawText}
+                onChange={(e) => setRawText(e.target.value)}
+                placeholder={"Of plak hier transacties, bijv.:\nAlbert Heijn 1234        23,45\nNS Groningen             12,00"}
+                rows={5}
+                style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11.5, border: "1px solid #D8D2C4", borderRadius: 8, padding: 8, background: "#FBFAF6" }}
+              />
+              <button
+                className="btab"
+                onClick={analyseer}
+                disabled={!rawText.trim()}
+                style={{ alignSelf: "flex-start", fontSize: 12.5, fontWeight: 600, color: "#FFFFFF", background: rawText.trim() ? "#0F5C52" : "#B8AF9C", borderRadius: 8, padding: "7px 14px" }}
+              >
+                Analyseer transacties
+              </button>
+            </>
+          )}
+
+          {rows && (
+            <>
+              <div style={{ fontSize: 11.5, color: "#8A8171" }}>
+                {rows.length} uitgaven gevonden. Controleer de categorie per transactie voordat je ze verwerkt in {periodLabel(currentMonth, payPeriodStartDay)}.
+              </div>
+              <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid #EEE9DD", borderRadius: 8 }}>
+                {rows.map((r) => (
+                  <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: "1px solid #EEE9DD" }}>
+                    <input type="checkbox" checked={r.include} onChange={(e) => updateRow(r.id, "include", e.target.checked)} style={{ accentColor: "#0F5C52" }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.omschrijving}</div>
+                      <div style={{ fontSize: 10.5, color: "#8A8171" }}>{fmt2(r.bedrag)}{r.datum ? ` · ${r.datum}` : ""}</div>
+                    </div>
+                    <select
+                      value={r.categorieId || ""}
+                      onChange={(e) => updateRow(r.id, "categorieId", e.target.value)}
+                      style={{ fontSize: 11.5, border: "1px solid #D8D2C4", borderRadius: 6, padding: "4px 6px", background: "#FBFAF6" }}
+                    >
+                      <option value="">geen categorie</option>
+                      {variable.map((c) => (
+                        <option key={c.id} value={c.id}>{c.naam}</option>
+                      ))}
+                    </select>
+                    {r.categorieId && (
+                      <button
+                        className="btab"
+                        title="Onthoud dit trefwoord voor deze categorie"
+                        onClick={() => addKeywordToCategorie(r.categorieId, r.omschrijving.split(/\s+/).slice(0, 2).join(" "))}
+                        style={{ fontSize: 10.5, color: "#0F5C52" }}
+                      >
+                        onthoud
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ fontSize: 12, color: "#3A362E" }}>
+                {Object.entries(totalenPerCategorie).map(([catId, bedrag]) => (
+                  <div key={catId} style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{categorieNaam(catId) || "onbekend"}</span>
+                    <span style={{ fontFamily: "'IBM Plex Mono', monospace" }}>{fmt2(bedrag)}</span>
+                  </div>
+                ))}
+                {Object.keys(totalenPerCategorie).length === 0 && (
+                  <div style={{ color: "#B8AF9C" }}>Nog geen transacties met een categorie geselecteerd.</div>
+                )}
+              </div>
+
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button className="btab" onClick={verwerk} style={{ fontSize: 12.5, fontWeight: 600, color: "#FFFFFF", background: "#0F5C52", borderRadius: 8, padding: "7px 14px" }}>
+                  Verwerk in {periodLabel(currentMonth, payPeriodStartDay)}
+                </button>
+                <button className="btab" onClick={() => setRows(null)} style={{ fontSize: 12, color: "#8A8171" }}>
+                  opnieuw
+                </button>
+              </div>
+              <div style={{ fontSize: 10.5, color: "#8A8171" }}>
+                Bedragen worden opgeteld bij wat je al had ingevuld bij "Budget per categorie" — vul dezelfde uitgaven dus niet nogmaals handmatig in.
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function OverzichtTab({ trendData, vasteJaarlijks, goals, gemSparen, today }) {
+  const jaarpotWaarschuwingen = vasteJaarlijks
+    .map((v) => ({ item: v, status: jaarpotStatus(v, today) }))
+    .filter((x) => x.status.achterstand);
+  const goalWaarschuwingen = goals
+    .map((g) => ({ goal: g, status: goalStatus(g, gemSparen, today) }))
+    .filter((x) => !x.status.opSchema);
+  const geenWaarschuwingen = jaarpotWaarschuwingen.length === 0 && goalWaarschuwingen.length === 0;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      {!geenWaarschuwingen && (
+        <Card style={{ borderColor: "#E8C4B3" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <AlertTriangle size={18} color="#B3492A" />
+            <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16 }}>Waarschuwingen</div>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {jaarpotWaarschuwingen.map(({ item, status }) => (
+              <div key={item.id} style={{ fontSize: 12.5, color: "#7A3A22", background: "#FBEAE3", borderRadius: 8, padding: "9px 11px" }}>
+                <strong>{item.naam}</strong> loopt achter: {status.actueelPct.toFixed(0)}% gespaard, verwacht was ~{status.verwachtPct.toFixed(0)}%. Nog {fmt2(status.tekort)} in te halen.
+              </div>
+            ))}
+            {goalWaarschuwingen.map(({ goal, status }) => (
+              <div key={goal.id} style={{ fontSize: 12.5, color: "#7A3A22", background: "#FBEAE3", borderRadius: 8, padding: "9px 11px" }}>
+                <strong>{goal.naam}</strong> ligt niet op schema: nodig is {fmt2(status.benodigdPerMaand)}/mnd, je spaart gemiddeld {fmt2(gemSparen)}/mnd.
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+      {geenWaarschuwingen && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Check size={16} color="#2F7A5C" />
+            <div style={{ fontSize: 13 }}>Je jaarpotjes en spaardoelen liggen op schema.</div>
+          </div>
+        </Card>
+      )}
+
+      <Card>
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16, marginBottom: 4 }}>Trend: uitgaven &amp; sparen per maand</div>
+        <div style={{ fontSize: 11.5, color: "#8A8171", marginBottom: 10 }}>Gebaseerd op de maanden waarin je gegevens hebt ingevuld.</div>
+        {trendData.length === 0 ? (
+          <div style={{ fontSize: 12, color: "#B8AF9C" }}>Nog geen gegevens. Vul eerst een paar maanden in bij "Deze maand".</div>
+        ) : (
+          <div style={{ width: "100%", height: 240 }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={trendData} margin={{ top: 6, right: 10, left: -18, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#EEE9DD" />
+                <XAxis dataKey="maand" tick={{ fontSize: 10, fill: "#8A8171" }} />
+                <YAxis tick={{ fontSize: 10, fill: "#8A8171" }} />
+                <Tooltip formatter={(v) => fmt2(v)} contentStyle={{ fontSize: 12, borderRadius: 8 }} />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Line type="monotone" dataKey="uitgaven" name="Variabele uitgaven" stroke="#B3492A" strokeWidth={2} dot={{ r: 3 }} />
+                <Line type="monotone" dataKey="sparen" name="Gespaard" stroke="#2F7A5C" strokeWidth={2} dot={{ r: 3 }} />
+                <Line type="monotone" dataKey="gestort" name="Gestort jaarpotjes" stroke="#0F5C52" strokeWidth={2} dot={{ r: 3 }} strokeDasharray="4 3" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
 function MaandTab({
   state, currentMonth, setCurrentMonth, monthData, setSpent, vasteTotaal, totaalInkomen,
   variabelBudgetTotaal, variabelBestedTotaal, sparenDezeMaand, jaarlijkseTekortDezeMaand,
+  jaarlijksGestortDezeMaand, jaarlijksPotTotaal, jaarlijksReservering,
   addJaarlijkseBetalingDezeMaand, removeJaarlijkseBetalingDezeMaand,
+  addStorting, removeStorting, wenslijst, toggleWishPlanning,
+  importSpentBulk, addKeywordToCategorie,
 }) {
   const pctVariabel = variabelBudgetTotaal > 0 ? (variabelBestedTotaal / variabelBudgetTotaal) * 100 : 0;
   const [showAdd, setShowAdd] = useState(false);
@@ -594,6 +1261,7 @@ function MaandTab({
   };
 
   const betalingen = monthData.jaarlijkseBetalingen || [];
+  const geplandeUitgaven = monthData.geplandeUitgaven || [];
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -625,6 +1293,12 @@ function MaandTab({
             value={fmt2(Math.abs(sparenDezeMaand))}
             color={sparenDezeMaand >= 0 ? "#2F7A5C" : "#B3492A"}
           />
+          <SummaryStat
+            label="Gestort jaarpotjes"
+            value={fmt2(jaarlijksGestortDezeMaand)}
+            sub={`aanbevolen ${fmt2(jaarlijksPotTotaal)}`}
+            color={jaarlijksGestortDezeMaand >= jaarlijksPotTotaal ? "#2F7A5C" : "#C08A2E"}
+          />
         </div>
         <div style={{ marginTop: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#8A8171", marginBottom: 4 }}>
@@ -639,6 +1313,16 @@ function MaandTab({
           </div>
         )}
       </Card>
+
+      <JaarpotSparenCard
+        vasteJaarlijks={state.vasteJaarlijks}
+        jaarlijksReservering={jaarlijksReservering}
+        jaarlijksPotTotaal={jaarlijksPotTotaal}
+        jaarlijksGestortDezeMaand={jaarlijksGestortDezeMaand}
+        stortingen={monthData.jaarlijkseStortingen || []}
+        addStorting={addStorting}
+        removeStorting={removeStorting}
+      />
 
       <Card style={{ padding: 0, overflow: "hidden" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px 6px" }}>
@@ -716,11 +1400,23 @@ function MaandTab({
         )}
       </Card>
 
+      <GeplandeUitgavenCard entries={geplandeUitgaven} wenslijst={wenslijst} toggleWishPlanning={toggleWishPlanning} variable={state.variable} />
+
+      <ImportUitgavenCard
+        variable={state.variable}
+        currentMonth={currentMonth}
+        payPeriodStartDay={state.payPeriodStartDay}
+        importSpentBulk={importSpentBulk}
+        addKeywordToCategorie={addKeywordToCategorie}
+      />
+
       <Card style={{ padding: 0, overflow: "hidden" }}>
         <div style={{ padding: "14px 20px 6px", fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>Budget per categorie</div>
         <div>
-          {state.variable.map((cat, i) => {
-            const spent = Number(monthData.spent[cat.id]) || 0;
+          {state.variable.map((cat) => {
+            const handmatig = Number(monthData.spent[cat.id]) || 0;
+            const gepland = geplandeUitgaven.filter((e) => e.categorieId === cat.id).reduce((a, e) => a + (Number(e.bedrag) || 0), 0);
+            const spent = handmatig + gepland;
             const pct = cat.budget > 0 ? (spent / cat.budget) * 100 : 0;
             const tone = pct > 100 ? "over" : pct > 85 ? "warn" : "ok";
             const over = spent - cat.budget;
@@ -742,6 +1438,9 @@ function MaandTab({
                   </div>
                 </div>
                 <ProgressBar pct={pct} tone={tone} />
+                {gepland > 0.005 && (
+                  <div style={{ fontSize: 10.5, color: "#8A8171", marginTop: 4 }}>waarvan {fmt2(gepland)} gepland (wenslijst)</div>
+                )}
                 {over > 0.005 && (
                   <div style={{ fontSize: 11.5, color: "#B3492A", marginTop: 4, display: "flex", alignItems: "center", gap: 4 }}>
                     <AlertTriangle size={11} /> {fmt2(over)} boven budget
@@ -756,54 +1455,168 @@ function MaandTab({
   );
 }
 
-function DoelenTab({ goals, updateGoal, gemSparen, today }) {
+const PRIORITEIT_LABELS = { hoog: "Moet", gemiddeld: "Leuk", laag: "Kan wachten" };
+const PRIORITEIT_KLEUR = { hoog: { bg: "#FBEAE3", fg: "#B3492A" }, gemiddeld: { bg: "#FCF3DC", fg: "#8A6A1F" }, laag: { bg: "#EFEAE0", fg: "#6B6353" } };
+const PRIORITEIT_RANG = { hoog: 0, gemiddeld: 1, laag: 2 };
+
+function WenslijstTab({ wenslijst, variable, currentMonth, payPeriodStartDay, addWishItem, updateWishItem, removeWishItem, toggleWishPlanning, toggleGekocht }) {
+  const [filter, setFilter] = useState("alles");
+  const totaal = wenslijst.reduce((s, w) => s + (Number(w.bedrag) || 0), 0);
+  const gepandDezeMaand = wenslijst.filter((w) => w.geplandInMaand === currentMonth).reduce((s, w) => s + (Number(w.bedrag) || 0), 0);
+
+  const gefilterd = wenslijst
+    .filter((w) => {
+      if (filter === "open") return !w.gekocht && w.geplandInMaand !== currentMonth;
+      if (filter === "gepland") return !w.gekocht && w.geplandInMaand === currentMonth;
+      if (filter === "gekocht") return w.gekocht;
+      return true;
+    })
+    .slice()
+    .sort((a, b) => (PRIORITEIT_RANG[a.prioriteit] ?? 1) - (PRIORITEIT_RANG[b.prioriteit] ?? 1));
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <Card>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <PiggyBank size={20} color="#0F5C52" />
+          <ShoppingCart size={20} color="#0F5C52" />
           <div>
-            <div style={{ fontSize: 12.5, color: "#8A8171" }}>Gemiddeld sparen per maand (op basis van ingevoerde maanden)</div>
-            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 17, fontWeight: 600 }}>{fmt2(gemSparen)}</div>
+            <div style={{ fontSize: 12.5, color: "#8A8171" }}>Totale waarde wenslijst</div>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 19, fontWeight: 600 }}>{fmt2(totaal)}</div>
+            <div style={{ fontSize: 11, color: "#8A8171", marginTop: 2 }}>
+              waarvan {fmt2(gepandDezeMaand)} ingepland voor {periodLabel(currentMonth, payPeriodStartDay)}
+            </div>
           </div>
         </div>
       </Card>
 
-      {goals.map((g) => {
-        const pct = g.doel > 0 ? (g.algespaard / g.doel) * 100 : 0;
-        const resterend = Math.max(0, g.doel - g.algespaard);
-        const maanden = Math.max(0, monthsBetween(today, g.deadline));
-        const benodigdPerMaand = maanden > 0 ? resterend / maanden : resterend;
-        const opSchema = gemSparen >= benodigdPerMaand;
-        return (
-          <Card key={g.id}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
-              <div>
-                <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16 }}>{g.naam}</div>
-                <div style={{ fontSize: 11.5, color: "#8A8171", display: "flex", alignItems: "center", gap: 4 }}>
-                  streefdatum
-                  <input className="date-input" type="date" value={g.deadline} onChange={(e) => updateGoal(g.id, "deadline", e.target.value)} />
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {[
+          { id: "alles", label: "Alles" },
+          { id: "open", label: "Nog te plannen" },
+          { id: "gepland", label: "Gepland" },
+          { id: "gekocht", label: "Gekocht" },
+        ].map((f) => (
+          <button
+            key={f.id}
+            className="btab"
+            onClick={() => setFilter(f.id)}
+            style={{
+              fontSize: 12, fontWeight: 600, borderRadius: 999, padding: "6px 12px",
+              color: filter === f.id ? "#FFFFFF" : "#6B6353",
+              background: filter === f.id ? "#0F5C52" : "#EFEAE0",
+            }}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      <Card style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 20px 6px" }}>
+          <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15 }}>Dingen die ik wil kopen</div>
+          <button
+            className="btab"
+            onClick={addWishItem}
+            style={{ fontSize: 12, fontWeight: 600, color: "#0F5C52", border: "1px solid #CFE3DC", borderRadius: 8, padding: "5px 10px" }}
+          >
+            + Toevoegen
+          </button>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#8A8171", padding: "0 20px 10px" }}>
+          "Gepland" telt mee als uitgave in de huidige maand. "Gekocht" is los daarvan gewoon een persoonlijk vinkje dat je het al hebt aangeschaft.
+        </div>
+        <div>
+          {gefilterd.map((w) => {
+            const gepland = w.geplandInMaand === currentMonth;
+            const geplandElders = w.geplandInMaand && w.geplandInMaand !== currentMonth;
+            const kleur = PRIORITEIT_KLEUR[w.prioriteit] || PRIORITEIT_KLEUR.gemiddeld;
+            return (
+              <div key={w.id} style={{ padding: "12px 20px", borderTop: "1px solid #EEE9DD" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <input
+                    type="text"
+                    value={w.naam}
+                    onChange={(e) => updateWishItem(w.id, "naam", e.target.value)}
+                    style={{
+                      fontFamily: "'Inter', sans-serif", fontSize: 13.5, border: "1px solid #D8D2C4", borderRadius: 8,
+                      padding: "6px 8px", background: "#FBFAF6", flex: 1, minWidth: 0,
+                      textDecoration: w.gekocht ? "line-through" : "none", color: w.gekocht ? "#8A8171" : "#1F2937",
+                    }}
+                  />
+                  <input
+                    className="num-input"
+                    style={{ width: 80 }}
+                    type="number"
+                    value={w.bedrag}
+                    onChange={(e) => updateWishItem(w.id, "bedrag", parseFloat(e.target.value) || 0)}
+                  />
+                  <button className="btab" onClick={() => removeWishItem(w.id)} style={{ fontSize: 11, color: "#B3492A", whiteSpace: "nowrap" }}>
+                    verwijder
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 9, flexWrap: "wrap" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "#3A362E" }}>
+                    <input type="checkbox" checked={gepland} onChange={() => toggleWishPlanning(w)} style={{ width: 16, height: 16, accentColor: "#0F5C52" }} />
+                    gepland deze maand
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11.5, color: "#3A362E" }}>
+                    <input type="checkbox" checked={!!w.gekocht} onChange={() => toggleGekocht(w.id)} style={{ width: 16, height: 16, accentColor: "#0F5C52" }} />
+                    gekocht
+                  </label>
+                  <select
+                    value={w.prioriteit || "gemiddeld"}
+                    onChange={(e) => updateWishItem(w.id, "prioriteit", e.target.value)}
+                    style={{
+                      fontFamily: "'Inter', sans-serif", fontSize: 11, fontWeight: 600, border: "none", borderRadius: 999,
+                      padding: "4px 10px", background: kleur.bg, color: kleur.fg,
+                    }}
+                  >
+                    <option value="hoog">Moet</option>
+                    <option value="gemiddeld">Leuk</option>
+                    <option value="laag">Kan wachten</option>
+                  </select>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+                  <label style={{ fontSize: 11, color: "#8A8171" }}>
+                    categorie{" "}
+                    <select
+                      value={w.categorieId || ""}
+                      onChange={(e) => updateWishItem(w.id, "categorieId", e.target.value || null)}
+                      style={{ fontFamily: "'Inter', sans-serif", fontSize: 12, border: "1px solid #D8D2C4", borderRadius: 8, padding: "4px 6px", background: "#FBFAF6" }}
+                    >
+                      <option value="">geen categorie</option>
+                      {variable.map((c) => (
+                        <option key={c.id} value={c.id}>{c.naam}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <input
+                    type="text"
+                    value={w.label || ""}
+                    onChange={(e) => updateWishItem(w.id, "label", e.target.value)}
+                    placeholder="label (optioneel, bv. verjaardag)"
+                    style={{ fontFamily: "'Inter', sans-serif", fontSize: 11.5, border: "1px solid #D8D2C4", borderRadius: 8, padding: "4px 8px", background: "#FBFAF6", flex: 1, minWidth: 140 }}
+                  />
+                </div>
+
+                <div style={{ marginTop: 6 }}>
+                  {gepland && <span style={{ fontSize: 11, fontWeight: 600, color: "#2F7A5C" }}>✓ ingepland deze maand</span>}
+                  {geplandElders && (
+                    <span style={{ fontSize: 11, color: "#C08A2E" }}>eerder gepland voor {periodLabel(w.geplandInMaand, payPeriodStartDay)}</span>
+                  )}
                 </div>
               </div>
-              <div style={{ fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: 999, background: opSchema ? "#E4F0EA" : "#FBEAE3", color: opSchema ? "#2F7A5C" : "#B3492A", display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
-                {opSchema ? <Check size={12} /> : <AlertTriangle size={12} />}
-                {opSchema ? "op schema" : "achterstand"}
-              </div>
+            );
+          })}
+          {gefilterd.length === 0 && (
+            <div style={{ padding: "0 20px 16px", fontSize: 12, color: "#B8AF9C" }}>
+              {wenslijst.length === 0 ? "Nog niets op je wenslijst. Voeg iets toe met de knop hierboven." : "Niets gevonden voor dit filter."}
             </div>
-
-            <ProgressBar pct={pct} tone={pct >= 100 ? "ok" : "warn"} />
-
-            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 12.5 }}>
-              <span style={{ color: "#8A8171" }}>
-                <input className="num-input" style={{ width: 84 }} type="number" value={g.algespaard} onChange={(e) => updateGoal(g.id, "algespaard", parseFloat(e.target.value) || 0)} /> / {fmt(g.doel)}
-              </span>
-              <span style={{ color: "#8A8171" }}>nog {maanden} mnd</span>
-            </div>
-
-            <DottedRow left="Nodig per maand" right={fmt2(benodigdPerMaand)} />
-          </Card>
-        );
-      })}
+          )}
+        </div>
+      </Card>
     </div>
   );
 }
@@ -836,7 +1649,7 @@ function RekeningenTab({ savingsAccounts, updateSavingsAccount, addSavingsAccoun
   );
 }
 
-function VastTab({ vasteMaandelijks, vasteMaandelijksTotaal, vasteJaarlijks, jaarlijksReservering, jaarlijksPotTotaal, totaalInkomen, variabelBudgetTotaal, today }) {
+function VastTab({ vasteMaandelijks, vasteMaandelijksTotaal, vasteJaarlijks, jaarlijksReservering, jaarlijksPotTotaal, gemStortingPerMaand, totaalInkomen, variabelBudgetTotaal, today }) {
   const vasteTotaal = vasteMaandelijksTotaal + jaarlijksPotTotaal;
   const sparenGepland = totaalInkomen - vasteTotaal - variabelBudgetTotaal;
 
@@ -855,30 +1668,47 @@ function VastTab({ vasteMaandelijks, vasteMaandelijksTotaal, vasteJaarlijks, jaa
       <Card>
         <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16, marginBottom: 4 }}>Jaarlijkse vaste lasten</div>
         <div style={{ fontSize: 11.5, color: "#8A8171", marginBottom: 10 }}>
-          Er wordt maandelijks automatisch geld gereserveerd zodat het potje op de verwachte datum vol zit.
+          Er wordt maandelijks automatisch geld gereserveerd zodat het potje op de verwachte datum vol zit. Wat je daadwerkelijk stort, log je zelf op het tabblad "Deze maand".
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
           {vasteJaarlijks.map((v) => {
             const pct = v.bedrag > 0 ? (v.gespaard / v.bedrag) * 100 : 0;
             const maanden = Math.max(0, monthsBetween(today, v.verwachteDatum));
             const perMaand = jaarlijksReservering(v);
+            const status = jaarpotStatus(v, today);
             return (
               <div key={v.id}>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, fontWeight: 500, marginBottom: 4 }}>
                   <span>{v.naam} <span style={{ fontWeight: 400, color: "#B8AF9C" }}>({v.frequentiePerJaar || 1}x/jaar)</span></span>
                   <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12.5, color: "#8A8171" }}>{fmt(v.gespaard)} / {fmt(v.bedrag)}</span>
                 </div>
-                <ProgressBar pct={pct} tone={pct >= 100 ? "ok" : "warn"} />
+                <ProgressBar pct={pct} tone={status.achterstand ? "over" : pct >= 100 ? "ok" : "warn"} />
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 11, color: "#8A8171" }}>
                   <span>verwacht over {maanden} mnd</span>
                   <span>reservering: {fmt2(perMaand)} /mnd</span>
                 </div>
+                {status.achterstand && (
+                  <div style={{ marginTop: 4, fontSize: 11, color: "#B3492A", display: "flex", alignItems: "center", gap: 4 }}>
+                    <AlertTriangle size={11} /> loopt achter — nog {fmt2(status.tekort)} in te halen
+                  </div>
+                )}
               </div>
             );
           })}
         </div>
         <div style={{ borderTop: "1px solid #EEE9DD", marginTop: 12, paddingTop: 10 }}>
           <DottedRow left="Totaal maandelijkse reservering" right={fmt2(jaarlijksPotTotaal)} bold />
+          <div style={{ marginTop: 6 }}>
+            <DottedRow
+              left="Gemiddeld daadwerkelijk gestort/mnd"
+              right={fmt2(gemStortingPerMaand)}
+            />
+          </div>
+          {gemStortingPerMaand < jaarlijksPotTotaal - 0.01 && (
+            <div style={{ marginTop: 8, fontSize: 11.5, color: "#C08A2E", display: "flex", alignItems: "center", gap: 4 }}>
+              <AlertTriangle size={12} /> Je zet gemiddeld minder opzij dan de aanbevolen reservering.
+            </div>
+          )}
         </div>
       </Card>
 
@@ -994,6 +1824,27 @@ function InstellingenTab({
         onRemove={removeVariable}
         newLabel="+ Budget toevoegen"
       />
+
+      <Card>
+        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16, marginBottom: 4 }}>Automatische categorisering</div>
+        <div style={{ fontSize: 11.5, color: "#8A8171", marginBottom: 10 }}>
+          Trefwoorden die gebruikt worden om bank-transacties bij "Bank-uitgaven importeren" automatisch aan een categorie te koppelen. Gescheiden door komma's.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {state.variable.map((c) => (
+            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 500, width: 130, flexShrink: 0 }}>{c.naam}</div>
+              <input
+                type="text"
+                value={(c.keywords || []).join(", ")}
+                onChange={(e) => updateVariable(c.id, "keywords", e.target.value.split(",").map((s) => s.trim()).filter(Boolean))}
+                placeholder="bijv. albert heijn, jumbo"
+                style={{ fontFamily: "'Inter', sans-serif", fontSize: 12.5, border: "1px solid #D8D2C4", borderRadius: 8, padding: "6px 8px", background: "#FBFAF6", flex: 1, minWidth: 0 }}
+              />
+            </div>
+          ))}
+        </div>
+      </Card>
 
       <EditableListCard
         title="Maandelijkse vaste lasten"
@@ -1127,6 +1978,55 @@ function InstellingenTab({
           {state.goals.length === 0 && <div style={{ fontSize: 12, color: "#B8AF9C" }}>Nog geen spaardoelen. Voeg er een toe met de knop hierboven.</div>}
         </div>
       </Card>
+    </div>
+  );
+}
+
+function DoelenTab({ goals, updateGoal, gemSparen, today }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <PiggyBank size={20} color="#0F5C52" />
+          <div>
+            <div style={{ fontSize: 12.5, color: "#8A8171" }}>Gemiddeld sparen per maand (op basis van ingevoerde maanden)</div>
+            <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 17, fontWeight: 600 }}>{fmt2(gemSparen)}</div>
+          </div>
+        </div>
+      </Card>
+
+      {goals.map((g) => {
+        const pct = g.doel > 0 ? (g.algespaard / g.doel) * 100 : 0;
+        const { maanden, benodigdPerMaand, opSchema } = goalStatus(g, gemSparen, today);
+        return (
+          <Card key={g.id}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
+              <div>
+                <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16 }}>{g.naam}</div>
+                <div style={{ fontSize: 11.5, color: "#8A8171", display: "flex", alignItems: "center", gap: 4 }}>
+                  streefdatum
+                  <input className="date-input" type="date" value={g.deadline} onChange={(e) => updateGoal(g.id, "deadline", e.target.value)} />
+                </div>
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: 999, background: opSchema ? "#E4F0EA" : "#FBEAE3", color: opSchema ? "#2F7A5C" : "#B3492A", display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" }}>
+                {opSchema ? <Check size={12} /> : <AlertTriangle size={12} />}
+                {opSchema ? "op schema" : "achterstand"}
+              </div>
+            </div>
+
+            <ProgressBar pct={pct} tone={pct >= 100 ? "ok" : "warn"} />
+
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 12.5 }}>
+              <span style={{ color: "#8A8171" }}>
+                <input className="num-input" style={{ width: 84 }} type="number" value={g.algespaard} onChange={(e) => updateGoal(g.id, "algespaard", parseFloat(e.target.value) || 0)} /> / {fmt(g.doel)}
+              </span>
+              <span style={{ color: "#8A8171" }}>nog {maanden} mnd</span>
+            </div>
+
+            <DottedRow left="Nodig per maand" right={fmt2(benodigdPerMaand)} />
+          </Card>
+        );
+      })}
     </div>
   );
 }
