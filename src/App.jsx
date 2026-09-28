@@ -585,14 +585,33 @@ export default function App() {
   }, [currentMonth]);
 
   // ---- NIEUW: bank-import in bulk verwerken + trefwoorden onthouden ----
-  const importSpentBulk = useCallback((sumsByCat) => {
+  // mode "add" (standaard) telt het geïmporteerde bedrag op bij wat er al stond.
+  // mode "replace" vervangt het bedrag per categorie door het geïmporteerde bedrag,
+  // handig als je een maand opnieuw wilt invullen zonder dubbel te tellen.
+  const importSpentBulk = useCallback((sumsByCat, mode = "add") => {
     setState((prev) => {
       const existing = prev.monthly[currentMonth] || { spent: {} };
       const nextSpent = { ...existing.spent };
       Object.entries(sumsByCat).forEach(([catId, bedrag]) => {
-        nextSpent[catId] = (Number(nextSpent[catId]) || 0) + (Number(bedrag) || 0);
+        if (mode === "replace") {
+          nextSpent[catId] = Number(bedrag) || 0;
+        } else {
+          nextSpent[catId] = (Number(nextSpent[catId]) || 0) + (Number(bedrag) || 0);
+        }
       });
       return { ...prev, monthly: { ...prev.monthly, [currentMonth]: { ...existing, spent: nextSpent } } };
+    });
+  }, [currentMonth]);
+
+  // ---- NIEUW: een maand volledig opnieuw kunnen invullen ----
+  // Wist alle ingevoerde gegevens (uitgaven per categorie, jaarlijkse betalingen/stortingen,
+  // geplande uitgaven) van de huidige maand, zodat je met een schone lei opnieuw kunt beginnen
+  // (bijvoorbeeld voordat je een bestand opnieuw uploadt).
+  const resetMonth = useCallback(() => {
+    setState((prev) => {
+      const monthly = { ...prev.monthly };
+      delete monthly[currentMonth];
+      return { ...prev, monthly };
     });
   }, [currentMonth]);
 
@@ -790,6 +809,7 @@ export default function App() {
             toggleWishPlanning={toggleWishPlanning}
             importSpentBulk={importSpentBulk}
             addKeywordToCategorie={addKeywordToCategorie}
+            resetMonth={resetMonth}
           />
         )}
 
@@ -1003,6 +1023,7 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
   const [rawText, setRawText] = useState("");
   const [fileName, setFileName] = useState("");
   const [rows, setRows] = useState(null);
+  const [mode, setMode] = useState("add"); // "add" = optellen bij bestaand, "replace" = vervangen
 
   const handleFile = (e) => {
     const file = e.target.files && e.target.files[0];
@@ -1043,7 +1064,7 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
 
   const verwerk = () => {
     if (!rows) return;
-    importSpentBulk(totalenPerCategorie);
+    importSpentBulk(totalenPerCategorie, mode);
     setRows(null);
     setRawText("");
     setFileName("");
@@ -1141,6 +1162,17 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
                 )}
               </div>
 
+              <div style={{ fontSize: 11.5, color: "#8A8171", display: "flex", flexDirection: "column", gap: 4, background: "#FBFAF6", border: "1px solid #EEE9DD", borderRadius: 8, padding: 10 }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                  <input type="radio" name="import-mode" checked={mode === "add"} onChange={() => setMode("add")} style={{ accentColor: "#0F5C52" }} />
+                  Optellen bij het bedrag dat al bij deze categorie staat
+                </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                  <input type="radio" name="import-mode" checked={mode === "replace"} onChange={() => setMode("replace")} style={{ accentColor: "#0F5C52" }} />
+                  Vervangen: gebruik dit bedrag in plaats van wat er al stond (handig als je deze maand opnieuw invult of een eerder bestand corrigeert)
+                </label>
+              </div>
+
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button className="btab" onClick={verwerk} style={{ fontSize: 12.5, fontWeight: 600, color: "#FFFFFF", background: "#0F5C52", borderRadius: 8, padding: "7px 14px" }}>
                   Verwerk in {periodLabel(currentMonth, payPeriodStartDay)}
@@ -1232,8 +1264,19 @@ function MaandTab({
   jaarlijksGestortDezeMaand, jaarlijksPotTotaal, jaarlijksReservering,
   addJaarlijkseBetalingDezeMaand, removeJaarlijkseBetalingDezeMaand,
   addStorting, removeStorting, wenslijst, toggleWishPlanning,
-  importSpentBulk, addKeywordToCategorie,
+  importSpentBulk, addKeywordToCategorie, resetMonth,
 }) {
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  const handleResetMonth = () => {
+    if (!confirmReset) {
+      setConfirmReset(true);
+      return;
+    }
+    resetMonth();
+    setConfirmReset(false);
+  };
+
   const pctVariabel = variabelBudgetTotaal > 0 ? (variabelBestedTotaal / variabelBudgetTotaal) * 100 : 0;
   const [showAdd, setShowAdd] = useState(false);
   const [selectedId, setSelectedId] = useState(state.vasteJaarlijks[0]?.id || "custom");
@@ -1263,6 +1306,10 @@ function MaandTab({
   const betalingen = monthData.jaarlijkseBetalingen || [];
   const geplandeUitgaven = monthData.geplandeUitgaven || [];
 
+  useEffect(() => {
+    setConfirmReset(false);
+  }, [currentMonth]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
@@ -1277,6 +1324,29 @@ function MaandTab({
           <ChevronRight size={20} />
         </button>
       </div>
+
+      <button
+        className="btab"
+        onClick={handleResetMonth}
+        onBlur={() => setConfirmReset(false)}
+        style={{
+          alignSelf: "center",
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontSize: 11.5,
+          fontWeight: 600,
+          color: confirmReset ? "#B3492A" : "#8A8171",
+          border: `1px solid ${confirmReset ? "#E7B7A6" : "#D8D2C4"}`,
+          borderRadius: 8,
+          padding: "5px 10px",
+          background: "transparent",
+        }}
+        title="Wist alle ingevoerde gegevens van deze maand, zodat je opnieuw kunt beginnen"
+      >
+        <RotateCcw size={12} />
+        {confirmReset ? "Zeker weten? Nogmaals klikken om te wissen" : "Maand opnieuw invullen"}
+      </button>
 
       <Card>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
