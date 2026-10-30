@@ -124,6 +124,7 @@ const defaultState = () => ({
   payPeriodStartDay: 25,
   budgetOverloop: false,
   bufferPercentage: 0,
+  uploadLog: [], // [{ id, uploadDatum, bestandsnaam, periodeKey, aantal, laatsteTransactieDatum }]
   // { "2026-09": { spent: {...}, jaarlijkseBetalingen: [...], jaarlijkseStortingen: [...], geplandeUitgaven: [...], extraWeggezet: [...] } }
   monthly: {},
 });
@@ -179,6 +180,7 @@ function safeMergeState(parsed) {
     payPeriodStartDay: typeof parsed.payPeriodStartDay === "number" ? parsed.payPeriodStartDay : d.payPeriodStartDay,
     budgetOverloop: typeof parsed.budgetOverloop === "boolean" ? parsed.budgetOverloop : d.budgetOverloop,
     bufferPercentage: typeof parsed.bufferPercentage === "number" ? parsed.bufferPercentage : d.bufferPercentage,
+    uploadLog: Array.isArray(parsed.uploadLog) ? parsed.uploadLog : [],
     monthly: parsed.monthly && typeof parsed.monthly === "object" ? parsed.monthly : {},
   };
 }
@@ -189,6 +191,39 @@ const maandVariabelTotaal = (entry) => {
   const geplandSom = (entry?.geplandeUitgaven || []).reduce((a, e) => a + (Number(e.bedrag) || 0), 0);
   return spentSom + geplandSom;
 };
+
+// ---- NIEUW: uploaddatum-logboek ----
+// Zet datums uit bankbestanden (20261026, 2026-10-26, 26-10-2026, 26/10/26) om naar "YYYY-MM-DD".
+function parseTransactieDatum(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})/);
+  if (m) {
+    const jaar = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${jaar}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  }
+  return null;
+}
+
+const formatDatumKort = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${d.getDate()} ${MONTH_NAMES[d.getMonth()].slice(0, 3)} ${d.getFullYear()}`;
+};
+
+const dagenGeleden = (iso, todayIso) => {
+  const a = new Date(iso);
+  const b = new Date(todayIso);
+  if (Number.isNaN(a.getTime()) || Number.isNaN(b.getTime())) return null;
+  return Math.max(0, Math.round((b - a) / 86400000));
+};
+
+const dagenGeledenTekst = (n) => (n === null ? "" : n === 0 ? "vandaag" : n === 1 ? "gisteren" : `${n} dagen geleden`);
 
 // besteed bedrag van één specifieke categorie in een maand (handmatig + gepland)
 const categorieBestedInMaand = (entry, catId) => {
@@ -385,10 +420,12 @@ function ProgressBar({ pct, tone }) {
 }
 
 function DottedRow({ left, right, bold }) {
+  // Lange labels mogen op een telefoon afbreken naar een tweede regel; alleen het bedrag
+  // rechts en de stippellijn blijven altijd op één regel staan.
   return (
-    <div style={{ display: "flex", alignItems: "baseline", gap: 6, fontWeight: bold ? 700 : 400 }}>
-      <span style={{ whiteSpace: "nowrap", color: "#3A362E" }}>{left}</span>
-      <span style={{ flex: 1, borderBottom: "1px dotted #B8AF9C", transform: "translateY(-3px)" }} />
+    <div style={{ display: "flex", alignItems: "baseline", flexWrap: "wrap", rowGap: 2, gap: 6, fontWeight: bold ? 700 : 400 }}>
+      <span style={{ color: "#3A362E" }}>{left}</span>
+      <span style={{ flex: "1 1 20px", minWidth: 16, borderBottom: "1px dotted #B8AF9C", transform: "translateY(-3px)" }} />
       <span style={{ whiteSpace: "nowrap", fontFamily: "'IBM Plex Mono', monospace", color: "#1F2937" }}>{right}</span>
     </div>
   );
@@ -600,6 +637,14 @@ export default function App() {
     });
   }, [currentMonth]);
 
+  // ---- NIEUW: uploaddatum registreren (nieuwste eerst, max. 30 bewaard) ----
+  const logUpload = useCallback((entry) => {
+    setState((prev) => ({
+      ...prev,
+      uploadLog: [{ id: newId("upl"), uploadDatum: new Date().toISOString().slice(0, 10), ...entry }, ...(prev.uploadLog || [])].slice(0, 30),
+    }));
+  }, []);
+
   // ---- NIEUW: extra ruimte direct wegzetten naar een spaardoel, jaarpotje of spaarrekening ----
   const addExtraWeggezet = useCallback((type, targetId, naam, bedrag) => {
     const amount = Number(bedrag) || 0;
@@ -736,7 +781,8 @@ export default function App() {
     setState((prev) => {
       const monthly = { ...prev.monthly };
       delete monthly[currentMonth];
-      return { ...prev, monthly };
+      const uploadLog = (prev.uploadLog || []).filter((u) => u.periodeKey !== currentMonth);
+      return { ...prev, monthly, uploadLog };
     });
   }, [currentMonth]);
 
@@ -875,7 +921,24 @@ export default function App() {
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap');
         * { box-sizing: border-box; }
+        html, body, #root { overflow-x: hidden; -webkit-text-size-adjust: 100%; }
         .btab { cursor:pointer; border:none; background:transparent; font-family:'Inter',sans-serif; }
+        .tabbar {
+          display: flex; gap: 4px; margin-bottom: 18px; background: #EFEAE0;
+          padding: 4px; border-radius: 12px; overflow-x: auto;
+          -webkit-overflow-scrolling: touch; scrollbar-width: none;
+        }
+        .tabbar::-webkit-scrollbar { display: none; }
+        .tabbtn {
+          flex: 0 0 auto; display: flex; align-items: center; justify-content: center; gap: 6px;
+          padding: 9px 12px; border-radius: 9px; font-size: 12.5px; font-weight: 600;
+          color: #6B6353; white-space: nowrap; transition: all 150ms ease;
+        }
+        .tabbtn-active { color: #FFFFFF; background: #0F5C52; }
+        @media (max-width: 420px) {
+          .tabbtn { padding: 8px 10px; font-size: 12px; gap: 5px; }
+        }
+        button, select, input[type=text], input[type=number], input[type=date] { min-height: 34px; }
         .btab:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid #0F5C52; outline-offset: 2px; }
         .num-input {
           font-family: 'IBM Plex Mono', monospace;
@@ -915,7 +978,7 @@ export default function App() {
           </div>
         )}
 
-        <div style={{ display: "flex", gap: 4, marginBottom: 18, background: "#EFEAE0", padding: 4, borderRadius: 12, flexWrap: "wrap" }}>
+        <div className="tabbar">
           {[
             { id: "maand", label: "Deze maand", icon: TrendingUp },
             { id: "wenslijst", label: "Wenslijst", icon: ShoppingCart },
@@ -927,15 +990,8 @@ export default function App() {
           ].map((t) => (
             <button
               key={t.id}
-              className="btab"
+              className={`btab tabbtn${tab === t.id ? " tabbtn-active" : ""}`}
               onClick={() => setTab(t.id)}
-              style={{
-                flex: 1, minWidth: 88, display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
-                padding: "9px 6px", borderRadius: 9, fontSize: 12.5, fontWeight: 600,
-                color: tab === t.id ? "#FFFFFF" : "#6B6353",
-                background: tab === t.id ? "#0F5C52" : "transparent",
-                transition: "all 150ms ease",
-              }}
             >
               <t.icon size={14} />
               <span className="tab-label">{t.label}</span>
@@ -979,6 +1035,9 @@ export default function App() {
             effectiefBudget={effectiefBudget}
             addExtraWeggezet={addExtraWeggezet}
             removeExtraWeggezet={removeExtraWeggezet}
+            logUpload={logUpload}
+            uploadLog={state.uploadLog || []}
+            today={today}
           />
         )}
 
@@ -1191,7 +1250,51 @@ function GeplandeUitgavenCard({ entries, wenslijst, toggleWishPlanning, variable
   );
 }
 
-function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importSpentBulk, addKeywordToCategorie }) {
+// ---- NIEUW: laat in één oogopslag zien wanneer er voor het laatst data is geüpload ----
+function UploadStatus({ uploadLog, currentMonth, payPeriodStartDay, today }) {
+  const laatste = uploadLog[0];
+  const dezePeriode = uploadLog.find((u) => u.periodeKey === currentMonth);
+  const dagen = laatste ? dagenGeleden(laatste.uploadDatum, today) : null;
+  const verouderd = dagen !== null && dagen > 7;
+  const dataTot = laatste?.laatsteTransactieDatum;
+  const dagenData = dataTot ? dagenGeleden(dataTot, today) : null;
+
+  let kleur = "#2F7A5C";
+  let bg = "#E4F0EA";
+  let kop = "";
+  let detail = "";
+  if (!laatste) {
+    kleur = "#7A3A22"; bg = "#FBEAE3";
+    kop = "Nog geen bestand geüpload";
+    detail = "Upload een bankexport om je uitgaven bij te werken.";
+  } else {
+    kop = `Laatst geüpload: ${formatDatumKort(laatste.uploadDatum)} (${dagenGeledenTekst(dagen)})`;
+    detail = `${laatste.bestandsnaam}`;
+    if (dataTot) detail += ` · transacties t/m ${formatDatumKort(dataTot)}`;
+    if (verouderd || (dagenData !== null && dagenData > 7)) {
+      kleur = "#7A5A12"; bg = "#FBF1D9";
+    }
+  }
+
+  return (
+    <div style={{ margin: "4px 20px 10px", padding: "9px 11px", borderRadius: 9, background: bg, color: kleur, fontSize: 11.5 }}>
+      <div style={{ fontWeight: 700 }}>{kop}</div>
+      {detail && <div style={{ marginTop: 2, wordBreak: "break-word" }}>{detail}</div>}
+      {laatste && dataTot && dagenData !== null && dagenData > 0 && (
+        <div style={{ marginTop: 4, fontWeight: 600 }}>
+          Aanvullen: transacties vanaf {formatDatumKort(new Date(new Date(dataTot).getTime() + 86400000).toISOString().slice(0, 10))} ontbreken nog.
+        </div>
+      )}
+      <div style={{ marginTop: 4, color: dezePeriode ? kleur : "#7A3A22", fontWeight: dezePeriode ? 400 : 600 }}>
+        {dezePeriode
+          ? `${periodLabel(currentMonth, payPeriodStartDay)}: bijgewerkt op ${formatDatumKort(dezePeriode.uploadDatum)}`
+          : `${periodLabel(currentMonth, payPeriodStartDay)}: nog niets geüpload`}
+      </div>
+    </div>
+  );
+}
+
+function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importSpentBulk, addKeywordToCategorie, logUpload, uploadLog = [], today }) {
   const [open, setOpen] = useState(false);
   const [rawText, setRawText] = useState("");
   const [fileName, setFileName] = useState("");
@@ -1238,6 +1341,13 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
   const verwerk = () => {
     if (!rows) return;
     importSpentBulk(totalenPerCategorie, mode);
+    const datums = rows.map((r) => parseTransactieDatum(r.datum)).filter(Boolean).sort();
+    logUpload({
+      bestandsnaam: fileName || "geplakte tekst",
+      periodeKey: currentMonth,
+      aantal: rows.filter((r) => r.include && r.categorieId).length,
+      laatsteTransactieDatum: datums.length ? datums[datums.length - 1] : null,
+    });
     setRows(null);
     setRawText("");
     setFileName("");
@@ -1254,6 +1364,7 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
           {open ? "Sluiten" : "+ Importeren"}
         </button>
       </div>
+      <UploadStatus uploadLog={uploadLog} currentMonth={currentMonth} payPeriodStartDay={payPeriodStartDay} today={today} />
       {!open && (
         <div style={{ padding: "0 20px 16px", fontSize: 11.5, color: "#8A8171" }}>
           Upload een CSV-export van je bank, of plak transacties — ook gekopieerd uit een PDF-afschrift — en de app koppelt ze automatisch aan een categorie.
@@ -1621,6 +1732,7 @@ function MaandTab({
   importSpentBulk, addKeywordToCategorie, resetMonth,
   variabelOver, sparenVolledigBudget, extraRuimte, extraRuimteBeschikbaar, extraWeggezetDezeMaand,
   bufferBedrag, gemSparen, carryoverMap, effectiefBudget, addExtraWeggezet, removeExtraWeggezet,
+  logUpload, uploadLog, today,
 }) {
   const [confirmReset, setConfirmReset] = useState(false);
 
@@ -1878,6 +1990,9 @@ function MaandTab({
         payPeriodStartDay={state.payPeriodStartDay}
         importSpentBulk={importSpentBulk}
         addKeywordToCategorie={addKeywordToCategorie}
+        logUpload={logUpload}
+        uploadLog={uploadLog}
+        today={today}
       />
 
       <Card style={{ padding: 0, overflow: "hidden" }}>
@@ -1899,8 +2014,8 @@ function MaandTab({
             const over = spent - budget;
             return (
               <div key={cat.id} style={{ padding: "12px 20px", borderTop: "1px solid #EEE9DD" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                  <div style={{ fontSize: 14, fontWeight: 500 }}>{cat.naam}</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", rowGap: 6, gap: 8, marginBottom: 6 }}>
+                  <div style={{ fontSize: 14, fontWeight: 500, minWidth: 0 }}>{cat.naam}</div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={{ fontSize: 12, color: "#8A8171" }}>/ {fmt(budget)}</span>
                     <input
@@ -2386,7 +2501,7 @@ function InstellingenTab({
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           {state.variable.map((c) => (
             <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <div style={{ fontSize: 12.5, fontWeight: 500, width: 130, flexShrink: 0 }}>{c.naam}</div>
+              <div style={{ fontSize: 12.5, fontWeight: 500, flex: "0 1 110px", minWidth: 60, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.naam}</div>
               <input
                 type="text"
                 value={(c.keywords || []).join(", ")}
