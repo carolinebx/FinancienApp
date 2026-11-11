@@ -11,6 +11,7 @@ import {
   potActie, potUndo, potResetPeriode, potPlan, jaarpotStatus,
   addMonthsToDate, cycleMonths, vandaagIso,
 } from "./Jaarpotjes.jsx";
+import { RuimteKaart, CategorieUitklap } from "./Budget.jsx";
 
 // ---------- constants & helpers ----------
 
@@ -621,7 +622,7 @@ export default function App() {
   // mode "add" (standaard) telt het geïmporteerde bedrag op bij wat er al stond.
   // mode "replace" vervangt het bedrag per categorie door het geïmporteerde bedrag,
   // handig als je een maand opnieuw wilt invullen zonder dubbel te tellen.
-  const importSpentBulk = useCallback((sumsByCat, mode = "add") => {
+  const importSpentBulk = useCallback((sumsByCat, mode = "add", rows = []) => {
     setState((prev) => {
       const existing = prev.monthly[currentMonth] || { spent: {} };
       const nextSpent = { ...existing.spent };
@@ -632,7 +633,75 @@ export default function App() {
           nextSpent[catId] = (Number(nextSpent[catId]) || 0) + (Number(bedrag) || 0);
         }
       });
-      return { ...prev, monthly: { ...prev.monthly, [currentMonth]: { ...existing, spent: nextSpent } } };
+      // Losse transacties bewaren, zodat je per budgetpotje kunt zien waar het aan is uitgegeven.
+      // Bij "vervangen" gaan de oude transacties van die categorieën weg.
+      const behouden = (existing.transacties || []).filter((t) => !(mode === "replace" && t.categorieId in sumsByCat));
+      const nieuw = rows
+        .filter((r) => r.include && r.categorieId)
+        .map((r) => ({
+          id: newId("tx"), categorieId: r.categorieId, omschrijving: r.omschrijving,
+          datum: parseTransactieDatum(r.datum), bedrag: Number(r.bedrag) || 0, bron: "import",
+        }));
+      return { ...prev, monthly: { ...prev.monthly, [currentMonth]: { ...existing, spent: nextSpent, transacties: [...behouden, ...nieuw] } } };
+    });
+  }, [currentMonth]);
+
+  // Uitgaven per budgetpotje beheren: toevoegen, verwijderen, naar een andere categorie verplaatsen.
+  const addTransactie = useCallback((catId, omschrijving, bedrag) => {
+    const b = Number(bedrag) || 0;
+    if (b <= 0) return;
+    setState((prev) => {
+      const existing = prev.monthly[currentMonth] || { spent: {} };
+      const t = { id: newId("tx"), categorieId: catId, omschrijving: (omschrijving || "").trim() || "Uitgave", datum: vandaagIso(), bedrag: b, bron: "handmatig" };
+      return {
+        ...prev,
+        monthly: {
+          ...prev.monthly,
+          [currentMonth]: {
+            ...existing,
+            spent: { ...existing.spent, [catId]: (Number(existing.spent && existing.spent[catId]) || 0) + b },
+            transacties: [...(existing.transacties || []), t],
+          },
+        },
+      };
+    });
+  }, [currentMonth]);
+
+  const removeTransactie = useCallback((id) => {
+    setState((prev) => {
+      const existing = prev.monthly[currentMonth] || { spent: {} };
+      const t = (existing.transacties || []).find((x) => x.id === id);
+      if (!t) return prev;
+      const huidig = Number(existing.spent && existing.spent[t.categorieId]) || 0;
+      return {
+        ...prev,
+        monthly: {
+          ...prev.monthly,
+          [currentMonth]: {
+            ...existing,
+            spent: { ...existing.spent, [t.categorieId]: Math.max(0, huidig - t.bedrag) },
+            transacties: existing.transacties.filter((x) => x.id !== id),
+          },
+        },
+      };
+    });
+  }, [currentMonth]);
+
+  const moveTransactie = useCallback((id, nieuweCatId) => {
+    setState((prev) => {
+      const existing = prev.monthly[currentMonth] || { spent: {} };
+      const t = (existing.transacties || []).find((x) => x.id === id);
+      if (!t || t.categorieId === nieuweCatId) return prev;
+      const spent = { ...existing.spent };
+      spent[t.categorieId] = Math.max(0, (Number(spent[t.categorieId]) || 0) - t.bedrag);
+      spent[nieuweCatId] = (Number(spent[nieuweCatId]) || 0) + t.bedrag;
+      return {
+        ...prev,
+        monthly: {
+          ...prev.monthly,
+          [currentMonth]: { ...existing, spent, transacties: existing.transacties.map((x) => (x.id === id ? { ...x, categorieId: nieuweCatId } : x)) },
+        },
+      };
     });
   }, [currentMonth]);
 
@@ -882,6 +951,9 @@ export default function App() {
             wenslijst={state.wenslijst}
             toggleWishPlanning={toggleWishPlanning}
             importSpentBulk={importSpentBulk}
+            addTransactie={addTransactie}
+            removeTransactie={removeTransactie}
+            moveTransactie={moveTransactie}
             addKeywordToCategorie={addKeywordToCategorie}
             resetMonth={resetMonth}
             variabelOver={variabelOver}
@@ -1129,7 +1201,7 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
 
   const verwerk = () => {
     if (!rows) return;
-    importSpentBulk(totalenPerCategorie, mode);
+    importSpentBulk(totalenPerCategorie, mode, rows);
     const datums = rows.map((r) => parseTransactieDatum(r.datum)).filter(Boolean).sort();
     logUpload({
       bestandsnaam: fileName || "geplakte tekst",
@@ -1255,7 +1327,7 @@ function ImportUitgavenCard({ variable, currentMonth, payPeriodStartDay, importS
                 </button>
               </div>
               <div style={{ fontSize: 10.5, color: "#8A8171" }}>
-                Bedragen worden opgeteld bij wat je al had ingevuld bij "Budget per categorie" — vul dezelfde uitgaven dus niet nogmaals handmatig in.
+                Bedragen worden opgeteld bij wat je al had ingevuld bij "Budget per categorie" — vul dezelfde uitgaven dus niet nogmaals handmatig in. Onder elk budget zie je daarna bij "Waar aan uitgegeven" welke transacties erbij horen.
               </div>
             </>
           )}
@@ -1437,50 +1509,13 @@ function ExtraRuimteBlok({
   );
 }
 
-function BestedenOverzichtCard({ variable, monthData, geplandeUitgaven, effectiefBudget, variabelBudgetTotaal, variabelBestedTotaal, variabelOver }) {
-  const pct = variabelBudgetTotaal > 0 ? (variabelBestedTotaal / variabelBudgetTotaal) * 100 : 0;
-  const tone = pct > 100 ? "over" : pct > 85 ? "warn" : "ok";
-  const rows = variable.map((cat) => {
-    const handmatig = Number(monthData.spent[cat.id]) || 0;
-    const gepland = geplandeUitgaven.filter((e) => e.categorieId === cat.id).reduce((a, e) => a + (Number(e.bedrag) || 0), 0);
-    const spent = handmatig + gepland;
-    const budget = effectiefBudget(cat);
-    return { id: cat.id, naam: cat.naam, spent, budget, over: budget - spent };
-  });
-  return (
-    <Card>
-      <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16, marginBottom: 12 }}>Uitgegeven &amp; nog te besteden</div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 12 }}>
-        <SummaryStat label="Uitgegeven" value={fmt2(variabelBestedTotaal)} sub={`van ${fmt(variabelBudgetTotaal)} budget`} color="#1F2937" />
-        <SummaryStat
-          label={variabelOver >= 0 ? "Nog te besteden" : "Boven budget"}
-          value={fmt2(Math.abs(variabelOver))}
-          sub={`${Math.round(pct)}% gebruikt`}
-          color={variabelOver >= 0 ? "#2F7A5C" : "#B3492A"}
-        />
-      </div>
-      <ProgressBar pct={pct} tone={tone} />
-      <div style={{ marginTop: 14, display: "flex", flexDirection: "column", gap: 8 }}>
-        {rows.map((r) => (
-          <div key={r.id} style={{ display: "flex", alignItems: "baseline", gap: 8, fontSize: 13 }}>
-            <span style={{ flex: 1, minWidth: 0, color: "#3A362E" }}>{r.naam}</span>
-            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 12, color: "#8A8171", whiteSpace: "nowrap" }}>{fmt(r.spent)} / {fmt(r.budget)}</span>
-            <span style={{ fontFamily: "'IBM Plex Mono', monospace", fontWeight: 600, minWidth: 74, textAlign: "right", whiteSpace: "nowrap", color: r.over >= 0 ? "#2F7A5C" : "#B3492A" }}>
-              {r.over >= 0 ? `nog ${fmt(r.over)}` : `−${fmt(Math.abs(r.over))}`}
-            </span>
-          </div>
-        ))}
-      </div>
-    </Card>
-  );
-}
-
 function MaandTab({
   state, currentMonth, setCurrentMonth, monthData, setSpent, vasteTotaal, totaalInkomen,
   variabelBudgetTotaal, variabelBestedTotaal, sparenDezeMaand, jaarlijkseTekortDezeMaand,
   jaarlijksGestortDezeMaand, jaarlijksPotTotaal, jaarlijksReservering,
   setTab, wenslijst, toggleWishPlanning,
   importSpentBulk, addKeywordToCategorie, resetMonth,
+  addTransactie, removeTransactie, moveTransactie,
   variabelOver, sparenVolledigBudget, extraRuimte, extraRuimteBeschikbaar, extraWeggezetDezeMaand,
   bufferBedrag, gemSparen, carryoverMap, effectiefBudget, addExtraWeggezet, removeExtraWeggezet,
   logUpload, uploadLog, today,
@@ -1577,7 +1612,7 @@ function MaandTab({
         )}
       </Card>
 
-      <BestedenOverzichtCard
+      <RuimteKaart
         variable={state.variable}
         monthData={monthData}
         geplandeUitgaven={geplandeUitgaven}
@@ -1585,51 +1620,28 @@ function MaandTab({
         variabelBudgetTotaal={variabelBudgetTotaal}
         variabelBestedTotaal={variabelBestedTotaal}
         variabelOver={variabelOver}
+        sparenDezeMaand={sparenDezeMaand}
+        sparenVolledigBudget={sparenVolledigBudget}
+        gemSparen={gemSparen}
+        bufferBedrag={bufferBedrag}
+        extraRuimte={extraRuimte}
+        currentMonth={currentMonth}
+        startDay={state.payPeriodStartDay}
+        today={today}
+        extra={
+          <ExtraRuimteBlok
+            extraRuimte={extraRuimte}
+            extraRuimteBeschikbaar={extraRuimteBeschikbaar}
+            extraWeggezetDezeMaand={extraWeggezetDezeMaand}
+            weggezetLijst={monthData.extraWeggezet || []}
+            goals={state.goals}
+            vasteJaarlijks={state.vasteJaarlijks}
+            savingsAccounts={state.savingsAccounts}
+            addExtraWeggezet={addExtraWeggezet}
+            removeExtraWeggezet={removeExtraWeggezet}
+          />
+        }
       />
-
-      <Card>
-        <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 16, marginBottom: 2 }}>Ruimte deze maand</div>
-        <div style={{ fontSize: 11.5, color: "#8A8171", marginBottom: 12 }}>
-          Wat er, naast je vaste lasten, nog over is om uit te geven of te sparen.
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <DottedRow
-            left="Nog te besteden binnen je categoriebudgetten"
-            right={fmt2(variabelOver)}
-            bold
-          />
-          <DottedRow
-            left="Vrij besteedbaar deze maand (los van budgetten)"
-            right={fmt2(sparenDezeMaand)}
-          />
-          <DottedRow
-            left="Verwacht over aan einde maand (bij volledig gebruik budget)"
-            right={fmt2(sparenVolledigBudget)}
-          />
-          <DottedRow
-            left="Gemiddeld spaar je per maand"
-            right={fmt2(gemSparen)}
-          />
-          {bufferBedrag > 0.005 && (
-            <DottedRow
-              left="Buffer (gereserveerd, niet beschikbaar als extra)"
-              right={fmt2(bufferBedrag)}
-            />
-          )}
-        </div>
-
-        <ExtraRuimteBlok
-          extraRuimte={extraRuimte}
-          extraRuimteBeschikbaar={extraRuimteBeschikbaar}
-          extraWeggezetDezeMaand={extraWeggezetDezeMaand}
-          weggezetLijst={monthData.extraWeggezet || []}
-          goals={state.goals}
-          vasteJaarlijks={state.vasteJaarlijks}
-          savingsAccounts={state.savingsAccounts}
-          addExtraWeggezet={addExtraWeggezet}
-          removeExtraWeggezet={removeExtraWeggezet}
-        />
-      </Card>
 
       <PotjesMaandKaart
         gestort={jaarlijksGestortDezeMaand}
@@ -1702,6 +1714,15 @@ function MaandTab({
                 {over <= 0.005 && (
                   <div style={{ fontSize: 11.5, color: "#2F7A5C", marginTop: 4 }}>nog {fmt2(-over)} te besteden</div>
                 )}
+                <CategorieUitklap
+                  cat={cat}
+                  monthData={monthData}
+                  gepland={geplandeUitgaven.filter((e) => e.categorieId === cat.id)}
+                  variable={state.variable}
+                  addTransactie={addTransactie}
+                  removeTransactie={removeTransactie}
+                  moveTransactie={moveTransactie}
+                />
               </div>
             );
           })}
